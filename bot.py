@@ -1,10 +1,36 @@
 import os
+import json
 import openai
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from datetime import datetime
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
+
+def get_sheet():
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        return sheet
+    except:
+        return None
+
+def log_event(event_type, user_id, username=""):
+    try:
+        sheet = get_sheet()
+        if sheet:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sheet.append_row([now, event_type, str(user_id), username])
+    except:
+        pass
 
 MESSAGES = {
     "anxiety": "Відчувати тривогу зараз — це нормальна реакція тіла на ненормальні обставини.\n\nПрактика заземлення «5-4-3-2-1»:\n\n👁 5 предметів, які ти бачиш\n✋ 4 речі, які ти можеш відчути на дотик\n👂 3 звуки, які ти чуєш прямо зараз\n👃 2 запахи, які ти відчуваєш\n👅 1 смак — зроби ковток води\n\nЗроби повільний глибокий вдих і видих. 💙",
@@ -14,6 +40,16 @@ MESSAGES = {
     "loneliness": "Ти не один/одна, навіть якщо зараз здається навпаки.\n\nПрактика співчуття до себе:\n\n1. Поклади долоню на серце\n2. Скажи подумки: «Мені зараз важко. Але я роблю все, що в моїх силах»\n3. Ти заслуговуєш на тепло 💛",
     "anger": "Гнів — це сильна та здорова емоція. Важливо дати йому безпечний вихід.\n\nШвидкі техніки:\n\n🚿 Умийся холодною водою\n📄 Зімни аркуш паперу з усієї сили\n⏸ Глибоко видихни перед відповіддю",
     "lost": "Коли земля тікає з-під ніг — спирайся на теперішній момент.\n\nВправа «Коло контролю»:\n\n❌ Не контролюєш: глобальні події, рішення інших\n✅ Контролюєш: що з'їси, коли ляжеш спати, з ким поговориш 🧭",
+}
+
+BUTTON_NAMES = {
+    "anxiety": "Тривога та паніка",
+    "stress": "Стрес та перенапруження",
+    "sleep": "Проблеми зі сном",
+    "apathy": "Апатія та виснаження",
+    "loneliness": "Самотність або провина",
+    "anger": "Дратівливість та гнів",
+    "lost": "Втрата опори",
 }
 
 user_sessions = {}
@@ -31,6 +67,8 @@ def get_main_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    log_event("START", user.id, user.username or "")
     await update.message.reply_text(
         "Привіт 👋\n\nЯ тут, щоб підтримати тебе. Як ти зараз почуваєшся?",
         reply_markup=get_main_keyboard()
@@ -39,6 +77,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user = query.from_user
 
     if query.data == "menu":
         await query.message.reply_text(
@@ -48,13 +87,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "maksym":
-        user_sessions[query.from_user.id] = []
+        user_sessions[user.id] = []
+        log_event("MAKSYM_START", user.id, user.username or "")
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await query.message.reply_text(
             "Привіт, я Максим 👋\n\nРозкажи мені що тебе турбує. Я тут, щоб вислухати.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
+
+    button_name = BUTTON_NAMES.get(query.data, query.data)
+    log_event(f"BUTTON: {button_name}", user.id, user.username or "")
 
     text = MESSAGES.get(query.data, "")
     keyboard = [
@@ -64,23 +107,24 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
 
-    if user_id not in user_sessions:
+    if user.id not in user_sessions:
         await update.message.reply_text(
             "Як ти зараз почуваєшся?",
             reply_markup=get_main_keyboard()
         )
         return
 
-    crisis_keywords = ["суїцид", "вбити себе", "не хочу жити", "самогубство"]
+    crisis_keywords = ["суїцид", "вбити себе", "не хочу жити", "самогубство", "суицид", "суицидальные", "убить себя", "не хочу жить", "покончить с жизнью", "покінчити з життям"]
     if any(word in update.message.text.lower() for word in crisis_keywords):
+        log_event("CRISIS", user.id, user.username or "")
         await update.message.reply_text(
             "⚠️ Я бачу, що тобі зараз дуже важко.\n\nБудь ласка, зателефонуй на гарячу лінію:\n📞 7333 — безкоштовно, цілодобово\n\nТи не один/одна."
         )
         return
 
-    history = user_sessions.get(user_id, [])
+    history = user_sessions.get(user.id, [])
     history.append({"role": "user", "content": update.message.text})
     if len(history) > 20:
         history = history[-20:]
@@ -97,7 +141,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = response.choices[0].message.content
         history.append({"role": "assistant", "content": reply})
-        user_sessions[user_id] = history
+        user_sessions[user.id] = history
+        log_event("MAKSYM_MESSAGE", user.id, user.username or "")
 
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
