@@ -24,6 +24,85 @@ def get_sheet():
     except:
         return None
 
+def get_users_sheet():
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            sheet = spreadsheet.worksheet("Користувачі")
+        except:
+            sheet = spreadsheet.add_worksheet(title="Користувачі", rows=1000, cols=12)
+            sheet.append_row([
+                "ID", "Username", "Ім'я (TG)", "Ім'я (назвав сам)",
+                "Стать", "Вік", "Місто", "Мова", "Перший візит",
+                "Останній візит", "Всього сесій", "Повідомлень Максиму"
+            ])
+        return sheet
+    except:
+        return None
+
+def update_user_record(user_id, username, first_name, language, udata, is_start=False):
+    try:
+        sheet = get_users_sheet()
+        if not sheet:
+            return
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        all_records = sheet.get_all_values()
+
+        user_row = None
+        for i, row in enumerate(all_records):
+            if row and str(row[0]) == str(user_id):
+                user_row = i + 1
+                break
+
+        if user_row:
+            existing = all_records[user_row - 1]
+
+            def safe_int(val):
+                try:
+                    return int(val)
+                except:
+                    return 0
+
+            sessions = safe_int(existing[10] if len(existing) > 10 else 0)
+            messages = safe_int(existing[11] if len(existing) > 11 else 0)
+
+            if is_start:
+                sessions += 1
+            else:
+                messages += 1
+
+            sheet.update(f"B{user_row}:L{user_row}", [[
+                username,
+                first_name,
+                udata.get("name", existing[3] if len(existing) > 3 else ""),
+                udata.get("gender", existing[4] if len(existing) > 4 else ""),
+                udata.get("age", existing[5] if len(existing) > 5 else ""),
+                udata.get("location", existing[6] if len(existing) > 6 else ""),
+                language,
+                existing[8] if len(existing) > 8 else now,
+                now,
+                sessions,
+                messages,
+            ]])
+        else:
+            sheet.append_row([
+                str(user_id), username, first_name,
+                udata.get("name", ""),
+                udata.get("gender", ""),
+                udata.get("age", ""),
+                udata.get("location", ""),
+                language, now, now,
+                1 if is_start else 0,
+                0 if is_start else 1,
+            ])
+    except:
+        pass
+
 def get_time_of_day():
     h = int(datetime.now().strftime("%H"))
     if 6 <= h < 12:
@@ -253,9 +332,9 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 ГОЛОВНЕ: Ти КОРИСНИЙ. Ти ЗАВЖДИ даєш конкретну допомогу. Ніколи не відмовляєш у техніці. Ніколи не повторюєш одне й те саме.
 
 ФОРМАТ ВІДПОВІДІ:
-- Пиши простим текстом БЕЗ зірочок, БЕЗ **жирного**, БЕЗ нумерованих списків з цифрами
-- Замість списків використовуй тире — або абзаци
-- Ніякого Markdown форматування взагалі
+- Пиши простим текстом БЕЗ зірочок, БЕЗ жирного, БЕЗ нумерованих списків
+- Замість списків використовуй тире або абзаци
+- Ніякого Markdown форматування
 - Типова відповідь 80-200 слів
 
 ЗАБОРОНЕНІ ФРАЗИ:
@@ -267,7 +346,7 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 ІМ'Я ТА РІД:
 - Якщо людина назвала ім'я — використовуй його
 - Через 2-3 повідомлення якщо не знаєш імені — спитай: "До речі, як тебе звати?"
-- Жіночі імена (Mary, Марія, Оля, Катя, Аня, Таня, Ліза, Віка, Даша, Настя, Маша та ін.) — зробила, відчула, прийшла
+- Жіночі імена (Mary, Марія, Оля, Катя, Аня, Таня, Ліза, Віка, Даша, Настя та ін.) — зробила, відчула, прийшла
 - Чоловічі — зробив, відчув, прийшов
 - Якщо не зрозуміло — спитай: "Як правильно — ти зробив чи зробила?"
 - Не питай ім'я якщо людина в гострому стані
@@ -278,7 +357,7 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 - Не питай все одразу
 
 ЯКЩО ЛЮДИНА ПРОСИТЬ ГАРЯЧУ ЛІНІЮ АБО ПСИХОЛОГА:
-Одразу дай номери без зволікань:
+Одразу дай номери:
 📞 7333 — Lifeline Ukraine (цілодобово, безкоштовно)
 📞 116 123 — Національна гаряча лінія
 📞 1545 — Урядова лінія підтримки
@@ -342,14 +421,11 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 "Нести все одній — дуже важко. Що зараз найважче?"
 
 ПЕРЕВІРКА ПІСЛЯ ВПРАВИ:
-Після кожної вправи додай одне питання:
-"Спробувала? Що помітила?" або "Як тобі це відчуття?"
-
-Якщо "не допомогло" →
-"Це нормально — перший раз просто знайомство. Хочеш спробуємо іншу?"
+Після кожної вправи: "Спробувала? Що помітила?"
+Якщо "не допомогло" → "Це нормально — перший раз просто знайомство. Хочеш спробуємо іншу?"
 
 НАГАДУВАННЯ ПРО СЕБЕ:
-Коли людина зробила щось важке → "Те що ти тут — це вже крок."
+Коли зробила щось важке → "Те що ти тут — це вже крок."
 Коли себе критикує → "Слабкі люди не шукають допомоги. Ти тут — це сила."
 
 ЗАВЕРШЕННЯ РОЗМОВИ:
@@ -399,6 +475,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id not in user_data_store:
         user_data_store[user.id] = {}
     log_event("START", user.id, user.username or "", user.first_name or "", user.language_code or "", hour)
+    update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", user_data_store[user.id], is_start=True)
     await update.message.reply_text(
         "Привіт 👋\n\nЯ тут, щоб підтримати тебе. Як ти зараз почуваєшся?",
         reply_markup=get_main_keyboard()
@@ -460,6 +537,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_data_store[user.id] = extract_user_info(update.message.text, user_data_store[user.id])
     udata = user_data_store[user.id]
+
+    update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", udata)
 
     if any(word in text_lower for word in VIOLENCE_KEYWORDS):
         crisis_users.add(user.id)
@@ -556,7 +635,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_context:
         system_prompt = system_prompt + f"\n\nКОНТЕКСТ: {user_context}"
 
-    # Явні питання про ім'я, вік, місто
     extra_question = ""
     if count == 2 and not udata.get("name"):
         extra_question = "\n\nДо речі, як тебе звати?"
