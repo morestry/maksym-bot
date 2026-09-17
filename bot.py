@@ -1,3 +1,14 @@
+# ============================================
+# MAKSYM BOT
+# Версія: 2.2
+# Дата: 2026-09-17
+# Зміни: виправлено gspread синтаксис,
+#        OpenAI розпізнавання імен,
+#        гарячі лінії тільки при кризі,
+#        фільтр поганих імен і міст,
+#        команда /version
+# ============================================
+
 import os
 import json
 import re
@@ -12,6 +23,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
+
+VERSION = "2.2 | 2026-09-17"
 
 # ============ GOOGLE SHEETS ============
 
@@ -44,7 +57,7 @@ def get_users_sheet():
                 "ID", "Username", "Ім'я (TG)", "Ім'я (назвав сам)",
                 "Стать", "Вік", "Місто", "Мова", "Перший візит",
                 "Останній візит", "Всього сесій", "Повідомлень Максиму"
-            ])
+            ], value_input_option="RAW")
             return sheet
     except:
         return None
@@ -98,7 +111,7 @@ def update_user_record(user_id, username, first_name, language, udata, is_start=
                 sessions += 1
             else:
                 messages += 1
-            sheet.update(f"B{user_row}:L{user_row}", [[
+            new_values = [[
                 username, first_name,
                 best(udata.get("name", ""), existing[3]),
                 best(udata.get("gender", ""), existing[4]),
@@ -107,7 +120,8 @@ def update_user_record(user_id, username, first_name, language, udata, is_start=
                 language,
                 existing[8] if existing[8] else now,
                 now, sessions, messages,
-            ]], value_input_option="RAW")
+            ]]
+            sheet.update(values=new_values, range_name=f"B{user_row}:L{user_row}")
         else:
             sheet.append_row([
                 str(user_id), username, first_name,
@@ -150,31 +164,62 @@ def clean_markdown(text):
     text = re.sub(r'#{1,6}\s', '', text)
     return text
 
+def extract_name_with_openai(text):
+    try:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ти строгий лінгвістичний асистент який витягує з тексту "
+                        "тільки справжні особисті імена людей.\n\n"
+                        "Правила:\n"
+                        "1. Ігноруй звичайні слова, прикметники, іменники "
+                        "(наприклад: Страшно, Зима, Весна, Привіт, Добре, Погано).\n"
+                        "2. Якщо в тексті немає явного імені — поверни строго слово None.\n"
+                        "3. Видавай тільки саме ім'я з великої літери, без лапок."
+                    )
+                },
+                {"role": "user", "content": text}
+            ],
+            max_tokens=10,
+            temperature=0
+        )
+        name = response.choices[0].message.content.strip()
+        if name.lower() == "none" or not name:
+            return None
+        return name
+    except:
+        return None
+
 def extract_user_info(text, user_data):
     text_lower = text.lower().strip()
-
-    BAD_NAMES = [
-        "бьет", "бить", "каже", "пише", "робить", "живе", "хоче",
-        "знає", "думає", "каже", "говорит", "бьёт", "ударил", "сказал",
-        "нормально", "добре", "погано", "просто", "дуже", "мене",
-    ]
 
     name_patterns = [
         r'мене звати\s+(\w+)',
         r'мене зовуть\s+(\w+)',
         r'меня зовут\s+(\w+)',
-        r'меня зовут\s+(\w+)',
         r'я\s+(\w+)$',
-        r'^(\w+)$',
+        r'я\s+(\w+),',
     ]
+
     if not user_data.get("name"):
+        found_name = None
         for pattern in name_patterns:
             match = re.search(pattern, text_lower)
             if match:
                 name = match.group(1).capitalize()
-                if len(name) > 1 and name.lower() not in BAD_NAMES:
-                    user_data["name"] = name
+                if len(name) > 1:
+                    found_name = name
                     break
+
+        if not found_name and len(text.split()) <= 3:
+            found_name = extract_name_with_openai(text)
+
+        if found_name:
+            user_data["name"] = found_name
 
     age_match = re.search(r'\b(\d{1,2})\s*(рік|років|года|лет|год|роки)\b', text_lower)
     if age_match and not user_data.get("age"):
@@ -212,15 +257,15 @@ def extract_user_info(text, user_data):
 
     BAD_LOCATIONS = [
         "нашим", "мною", "тобою", "ним", "нею", "нами",
-        "мене", "тебе", "його", "неї",
+        "мене", "тебе", "його", "неї", "страшно", "важко",
     ]
     location_patterns = [
         r'живу в\s+(\w+)',
-        r'я з\s+(\w+)',
         r'нахожусь в\s+(\w+)',
         r'знаходжусь в\s+(\w+)',
         r'перебуваю в\s+(\w+)',
         r'я зараз в\s+(\w+)',
+        r'я з\s+(\w+)',
     ]
     if not user_data.get("location"):
         for pattern in location_patterns:
@@ -241,7 +286,7 @@ def extract_user_info(text, user_data):
 
 MESSAGES = {
     "anxiety": (
-        "Відчувати тривогу зараз — це нормальна реакція тіла на ненормальні обставини. Коли накриває хвиля паніки, наше тіло готується тікати або битися, навіть якщо прямої загрози поруч немає.\n\n"
+        "Відчувати тривогу зараз — це нормальна реакція тіла на ненормальні обставини.\n\n"
         "Практика заземлення «5-4-3-2-1»:\n\n"
         "👁 5 предметів, які ти бачиш\n"
         "✋ 4 речі, які ти можеш відчути на дотик\n"
@@ -252,14 +297,14 @@ MESSAGES = {
         "Це лише перший крок. Якщо хочеш виговоритися — Максим поруч і готовий вислухати."
     ),
     "stress": (
-        "Стрес виснажує не лише думки, а й накопичується в тілі. Коли нервова система перевантажена, важливо дати їй сигнал: «Зараз я в безпеці, можна розслабитися».\n\n"
+        "Стрес виснажує не лише думки, а й накопичується в тілі.\n\n"
         "Вправа: Прогресивна м'язова релаксація\n\n"
         "1. Сядь або ляж у зручну позу\n"
-        "2. Міцно стисни кулаки та напруж руки на 5 секунд\n"
-        "3. Різко розслаб руки та зроби глибокий видих\n"
-        "4. Повтори те саме з плечима, обличчям та ногами\n"
+        "2. Стисни кулаки на 5 секунд — відпусти\n"
+        "3. Підтягни плечі до вух — відпусти\n"
+        "4. Зажмур очі — відпусти\n"
         "5. Зроби ковток чистої води\n\n"
-        "Щоб розвантажити голову від зайвих думок — продовжи діалог із Максимом."
+        "Щоб розвантажити голову — продовжи діалог із Максимом."
     ),
     "sleep": (
         "Складність із засинанням — сигнал що мозок не може вимкнути «режим контролю».\n\n"
@@ -348,7 +393,6 @@ user_last_button = {}
 user_session_start = {}
 user_message_count = {}
 user_data_store = {}
-user_data_prev = {}
 
 # ============ ПРОМПТИ ============
 
@@ -363,106 +407,91 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 - Дзеркаль мову людини (українська або російська)
 
 ЗАБОРОНЕНО:
-- "я не можу поділитися техніками"
-- Будь-які відмови допомогти
+- Відмовляти у техніці
 - Питати "хочеш техніку?" — давай одразу якщо людина описує стан
 - Повторювати одне й те саме питання двічі
-- Згадувати гарячі лінії при звичайних зверненнях (безсоння, тривога, стрес, апатія)
+- Згадувати гарячі лінії при звичайних зверненнях
 
 ГАРЯЧІ ЛІНІЇ — ТІЛЬКИ КОЛИ:
 - Людина сама просить гарячу лінію або психолога
-- Спрацювали кризові слова (суїцид, насильство, самоушкодження)
+- Спрацювали кризові слова
 У всіх інших випадках — НЕ згадуй гарячі лінії взагалі.
 
-ДАВАЙ ТЕХНІКУ ОДРАЗУ (без питання "хочеш?"):
-Якщо людина описує стан — це вже запит на допомогу.
+ДАВАЙ ТЕХНІКУ ОДРАЗУ:
+Якщо людина описує стан — це вже запит.
 
 "не можу уснуть", "думки не дають спати", "безсоння" →
 "Вдих 4 секунди, затримай 7, видих 8. Повтори 4 рази. Відклади телефон."
 
-"накрило", "паніка", "трясе", "не можу дихати" →
+"накрило", "паніка", "трясе" →
 "Стопи на підлозі. Повільний видих. Назви 3 речі що бачиш."
 
-"думки крутяться", "не можу зупинити думки", "прокручую одне" →
-"Скажи собі: Я помічаю думку що... Це просто думка, не факт. Уяви що вона пливе як хмара."
+"думки крутяться", "не можу зупинити думки" →
+"Скажи собі: Я помічаю думку що... Це просто думка. Уяви що вона пливе як хмара."
 
-"злюся", "гнів", "роздратування" →
+"злюся", "гнів" →
 "Пауза. Глибокий видих. Зімни аркуш паперу — дай тілу вихід."
 
-"порожнеча", "нічого не відчуваю", "апатія" →
+"порожнеча", "апатія" →
 "Де в тілі ти це відчуваєш? Яке воно? Просто помітити — вже крок."
 
 "навіщо це все", "немає сенсу" →
 "Якби ця важкість зникла — що важливе ти б робила?"
 
-"болить голова", "стиснуто в грудях", "ком у горлі" →
+"болить голова", "стиснуто в грудях" →
 "Поклади руку туди де відчуваєш. Зроби повільний видих прямо в це місце."
 
-"просто хочу виговоритися", "нема кому розказати" →
-НЕ давай вправу. Слухай: коротке віддзеркалення + одне питання.
+"просто хочу виговоритися" →
+НЕ давай вправу. Слухай і задай одне питання.
 
-ЯКЩО ЛЮДИНА ПРОСИТЬ ГАРЯЧУ ЛІНІЮ АБО ПСИХОЛОГА:
-📞 7333 — Lifeline Ukraine (цілодобово, безкоштовно)
+ЯКЩО ЛЮДИНА ПРОСИТЬ ГАРЯЧУ ЛІНІЮ:
+📞 7333 — Lifeline Ukraine
 📞 116 123 — Національна гаряча лінія
-📞 1545 — Урядова лінія підтримки
+📞 1545 — Урядова лінія
 
 РОЗУМІЙ НЕЧІТКІ ЗАПИТИ:
-- "какие техники", "що робити", "помоги" → дай вправу одразу
-- "устала", "все", "не можу" → спитай: "що зараз найважче?"
-- Одне слово ("страх", "тривога", "погано") → дай техніку або спитай одне
-- Ніколи не проси переформулювати
-- Люди пишуть з помилками — розумій намір
+- Помилки, суржик — розумій намір
+- "устала", "все", "не можу" → "що зараз найважче?"
+- Одне слово → дай техніку або спитай одне
 
 ІМ'Я ТА РІД:
-- Використовуй ТІЛЬКИ ім'я з контексту або що людина сама написала
-- НЕ вигадуй і НЕ скорочуй — Mary це Mary, не Маша
-- НЕ питай ім'я якщо воно вже є в контексті
-- Жіночі (Mary, Марія, Оля, Катя, Аня, Ліза, Віка, Даша, Настя та ін.) → зробила, відчула
+- Тільки ім'я з контексту або що людина сама написала
+- НЕ вигадуй і НЕ скорочуй — Mary це Mary
+- НЕ питай якщо ім'я вже є
+- Жіночі → зробила, відчула
 - Чоловічі → зробив, відчув
-- Не зрозуміло → "Як правильно — ти зробив чи зробила?"
-- Не питай ім'я в гострий момент
 
-ГОРЕ І ВТРАТА:
-"хтось помер", "він загинув", "вона померла" →
-НЕ давай вправ. Тільки присутність:
-"Мені дуже шкода. Це величезна втрата. Не потрібно нікуди поспішати з цим болем."
-НІКОЛИ: "час лікує", "він в кращому місці", "треба триматись"
+ГОРЕ:
+"хтось помер", "він загинув" → НЕ давай вправ:
+"Мені дуже шкода. Це величезна втрата. Не потрібно нікуди поспішати."
+НІКОЛИ: "час лікує", "він в кращому місці"
 
-ПІДТРИМКА ТИХ ХТО ДОГЛЯДАЄ:
-"чоловік на фронті", "дитина хворіє", "доглядаю за мамою", "все на мені" →
+ПІДТРИМКА ДОГЛЯДАЧІВ:
+"чоловік на фронті", "дитина хворіє", "все на мені" →
 "Коли несеш стільки — хто зараз піклується про тебе?"
 
-ПЕРЕВІРКА ПІСЛЯ ВПРАВИ:
-"Спробувала? Що помітила?"
-Якщо "не допомогло" → "Це нормально — перший раз просто знайомство. Хочеш спробуємо іншу?"
-
-НАГАДУВАННЯ ПРО СЕБЕ:
-Коли зробила щось важке → "Те що ти тут — це вже крок."
-Коли себе критикує → "Слабкі люди не шукають допомоги."
+ПІСЛЯ ВПРАВИ: "Спробувала? Що помітила?"
 
 ЗАВЕРШЕННЯ:
-"дякую", "допомогло", "стало краще" → "Радий що трохи легше. Повертайся коли потрібно. 💙"
-"поки", "до побачення" → "Бережи себе. 💙"
-"все", "ладно" → "Як ти зараз? Є що ще на серці?"
-
-ДО ПСИХОЛОГА — тільки коли людина сама питає або ситуація серйозна.
-НЕ вставляй в кожну відповідь."""
+"дякую", "стало краще" → "Радий що трохи легше. Повертайся коли потрібно. 💙"
+"поки" → "Бережи себе. 💙"
+"все", "ладно" → "Як ти зараз? Є що ще на серці?" """
 
 SYSTEM_PROMPT_CRISIS = """Ти — Максим, теплий та надзвичайно емпатичний психологічний помічник.
 
 Користувач перебуває у гострому кризовому стані.
 
-ФОРМАТ: Простий текст БЕЗ зірочок і Markdown.
+ФОРМАТ: Простий текст БЕЗ зірочок.
 
 ВАЖЛИВО:
-- Не проводь вправ якщо людина не просить
-- Якщо просить техніку — дай одну просту (дихання або 5-4-3-2-1)
-- Не заспокоюй формулами ("все буде добре")
+- Не проводь вправ якщо не просить
+- Якщо просить — дай одну просту (дихання або 5-4-3-2-1)
+- Не заспокоюй формулами
 - М'яко заохочуй зателефонувати: 7333, 116 123, 1545
-- Пиши коротко і дуже дбайливо
-- Дзеркаль мову (українська або російська)
+- Коротко і дбайливо
+- Дзеркаль мову
 - Не питай про спосіб чи план
-- Не повторюй одне й те саме двічі"""
+- Не повторюй одне й те саме"""
 
 # ============ КЛАВІАТУРА ============
 
@@ -480,13 +509,22 @@ def get_main_keyboard():
 
 # ============ ХЕНДЛЕРИ ============
 
+async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Maksym Bot v{VERSION}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     hour = datetime.now().strftime("%H:00")
     if user.id not in user_data_store:
         user_data_store[user.id] = {}
-    log_event("START", user.id, user.username or "", user.first_name or "", user.language_code or "", hour)
-    update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", user_data_store[user.id], is_start=True)
+    try:
+        log_event("START", user.id, user.username or "", user.first_name or "", user.language_code or "", hour)
+    except:
+        pass
+    try:
+        update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", user_data_store[user.id], is_start=True)
+    except:
+        pass
     await update.message.reply_text(
         "Привіт 👋\n\nЯ тут, щоб підтримати тебе. Як ти зараз почуваєшся?",
         reply_markup=get_main_keyboard()
@@ -512,10 +550,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_message_count[user.id] = 0
         last_button = user_last_button.get(user.id, "—")
         udata = user_data_store.get(user.id, {})
-        log_event("MAKSYM_START", user.id, user.username or "", user.first_name or "",
-                  user.language_code or "", hour, extra=f"Прийшов з: {last_button}",
-                  user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                  age=udata.get("age", ""), location=udata.get("location", ""))
+        try:
+            log_event("MAKSYM_START", user.id, user.username or "", user.first_name or "",
+                      user.language_code or "", hour, extra=f"Прийшов з: {last_button}",
+                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
+                      age=udata.get("age", ""), location=udata.get("location", ""))
+        except:
+            pass
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await query.message.reply_text(
             "Привіт, я Максим 👋\n\nРозкажи мені що тебе турбує. Я тут, щоб вислухати.",
@@ -526,10 +567,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     button_name = BUTTON_NAMES.get(query.data, query.data)
     user_last_button[user.id] = button_name
     udata = user_data_store.get(user.id, {})
-    log_event(f"BUTTON: {button_name}", user.id, user.username or "", user.first_name or "",
-              user.language_code or "", hour,
-              user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-              age=udata.get("age", ""), location=udata.get("location", ""))
+    try:
+        log_event(f"BUTTON: {button_name}", user.id, user.username or "", user.first_name or "",
+                  user.language_code or "", hour,
+                  user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
+                  age=udata.get("age", ""), location=udata.get("location", ""))
+    except:
+        pass
 
     text = MESSAGES.get(query.data, "")
     keyboard = [
@@ -550,18 +594,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[user.id] = extract_user_info(update.message.text, user_data_store[user.id])
     udata = user_data_store[user.id]
 
-    # Оновлюємо лист користувачів тільки якщо є нові дані
     if udata != prev_data:
-        update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", udata)
+        try:
+            update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", udata)
+        except:
+            pass
 
     if any(word in text_lower for word in VIOLENCE_KEYWORDS):
         crisis_users.add(user.id)
         if user.id not in user_sessions:
             user_sessions[user.id] = []
-        log_event("VIOLENCE", user.id, user.username or "", user.first_name or "",
-                  user.language_code or "", hour,
-                  user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                  age=udata.get("age", ""), location=udata.get("location", ""))
+        try:
+            log_event("VIOLENCE", user.id, user.username or "", user.first_name or "",
+                      user.language_code or "", hour,
+                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
+                      age=udata.get("age", ""), location=udata.get("location", ""))
+        except:
+            pass
         await update.message.reply_text(
             "Те, що ти зараз кажеш — серйозно, і добре, що ти це сказала.\n\n"
             "Ти не мусиш бути з цим наодинці:\n\n"
@@ -576,10 +625,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         crisis_users.add(user.id)
         if user.id not in user_sessions:
             user_sessions[user.id] = []
-        log_event("SELF_HARM", user.id, user.username or "", user.first_name or "",
-                  user.language_code or "", hour,
-                  user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                  age=udata.get("age", ""), location=udata.get("location", ""))
+        try:
+            log_event("SELF_HARM", user.id, user.username or "", user.first_name or "",
+                      user.language_code or "", hour,
+                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
+                      age=udata.get("age", ""), location=udata.get("location", ""))
+        except:
+            pass
         await update.message.reply_text(
             "Я чую, що тобі зараз дуже боляче. Дякую, що сказала про це.\n\n"
             "Будь ласка, не залишайся з цим сам на сам:\n\n"
@@ -593,10 +645,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         crisis_users.add(user.id)
         if user.id not in user_sessions:
             user_sessions[user.id] = []
-        log_event("CRISIS", user.id, user.username or "", user.first_name or "",
-                  user.language_code or "", hour,
-                  user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                  age=udata.get("age", ""), location=udata.get("location", ""))
+        try:
+            log_event("CRISIS", user.id, user.username or "", user.first_name or "",
+                      user.language_code or "", hour,
+                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
+                      age=udata.get("age", ""), location=udata.get("location", ""))
+        except:
+            pass
         await update.message.reply_text(
             "Я бачу, що тобі зараз неймовірно важко. Дякую, що не залишилася з цим наодинці.\n\n"
             "Будь ласка, зателефонуй — тебе вислухають:\n\n"
@@ -675,10 +730,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history.append({"role": "assistant", "content": reply})
         user_sessions[user.id] = history
 
-        log_event("MAKSYM_MESSAGE", user.id, user.username or "", user.first_name or "",
-                  user.language_code or "", hour, extra=extra,
-                  user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                  age=udata.get("age", ""), location=udata.get("location", ""))
+        try:
+            log_event("MAKSYM_MESSAGE", user.id, user.username or "", user.first_name or "",
+                      user.language_code or "", hour, extra=extra,
+                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
+                      age=udata.get("age", ""), location=udata.get("location", ""))
+        except:
+            pass
 
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -688,6 +746,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("version", version))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
