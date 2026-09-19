@@ -1,9 +1,12 @@
 # ============================================
 # MAKSYM BOT
-# Версія: 2.3
-# Дата: 2026-09-17
-# Зміни: тест Google Sheets в /version,
-#        виправлено блокування log_event
+# Версія: 2.5
+# Дата: 2026-09-19
+# Зміни: новий кризовий модуль (regex+GPT),
+#        виправлено Лист1 (окреме з'єднання),
+#        update_user_record тільки при START,
+#        гендерно-нейтральні відповіді,
+#        вихід з кризи: 8 повід + 20 хв
 # ============================================
 
 import os
@@ -21,31 +24,26 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
-VERSION = "2.3 | 2026-09-17"
+VERSION = "2.5 | 2026-09-19"
 
 # ============ GOOGLE SHEETS ============
 
-def get_spreadsheet():
-    try:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        return client.open_by_key(GOOGLE_SHEET_ID)
-    except:
-        return None
+def _get_client():
+    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
 
 def get_sheet():
     try:
-        return get_spreadsheet().sheet1
-    except:
+        return _get_client().open_by_key(GOOGLE_SHEET_ID).sheet1
+    except Exception as e:
+        print(f"GET_SHEET ERROR: {e}")
         return None
 
 def get_users_sheet():
     try:
-        spreadsheet = get_spreadsheet()
-        if not spreadsheet:
-            return None
+        spreadsheet = _get_client().open_by_key(GOOGLE_SHEET_ID)
         try:
             return spreadsheet.worksheet("Користувачі")
         except:
@@ -56,25 +54,38 @@ def get_users_sheet():
                 "Останній візит", "Всього сесій", "Повідомлень Максиму"
             ], value_input_option="RAW")
             return sheet
-    except:
+    except Exception as e:
+        print(f"GET_USERS_SHEET ERROR: {e}")
         return None
 
-def log_event(event_type, user_id, username="", first_name="", language="", hour="", extra="", user_name_given="", gender="", age="", location=""):
+def log_event(event_type, user_id, username="", first_name="", language="",
+              hour="", last_button="", msg_count="", duration=""):
     try:
         sheet = get_sheet()
-        if sheet:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            is_anon = "Анонім" if not username else "Є username"
-            weekday_ua = get_weekday_ua()
-            time_of_day = get_time_of_day()
-            row = [
-                now, event_type, str(user_id), username, first_name,
-                language, hour, is_anon, weekday_ua, time_of_day, extra,
-                user_name_given, gender, str(age), str(location)
-            ]
-            sheet.append_row(row, value_input_option="RAW")
-    except:
-        pass
+        if not sheet:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        is_anon = "Анонім" if not username else "Є username"
+        weekday_ua = get_weekday_ua()
+        time_of_day = get_time_of_day()
+        row = [
+            now,
+            event_type,
+            str(user_id),
+            str(username),
+            str(first_name),
+            str(language),
+            str(hour),
+            is_anon,
+            weekday_ua,
+            time_of_day,
+            str(last_button),
+            str(msg_count),
+            str(duration),
+        ]
+        sheet.append_row(row, value_input_option="RAW")
+    except Exception as e:
+        print(f"LOG_EVENT ERROR: {e}")
 
 def update_user_record(user_id, username, first_name, language, udata, is_start=False):
     try:
@@ -128,10 +139,10 @@ def update_user_record(user_id, username, first_name, language, udata, is_start=
                 1 if is_start else 0,
                 0 if is_start else 1,
             ], value_input_option="RAW")
-    except:
-        pass
+    except Exception as e:
+        print(f"UPDATE_USER ERROR: {e}")
 
-# ============ ДОПОМІЖНІ ФУНКЦІЇ ============
+# ============ ДОПОМІЖНІ ============
 
 def get_time_of_day():
     h = int(datetime.now().strftime("%H"))
@@ -161,34 +172,178 @@ def clean_markdown(text):
     text = re.sub(r'#{1,6}\s', '', text)
     return text
 
-def extract_name_with_openai(text):
+# ============ КРИЗОВИЙ МОДУЛЬ ============
+
+SUICIDE_PATTERNS = [
+    r"не\s*хоч\w*\s*(більше\s*|вже\s*|далі\s*)?жи\w*",
+    r"жи\w*\s*не\s*хоч\w*",
+    r"хоч\w*\s*(по)?мерт\w*",
+    r"хоч\w*\s*(по)?умерт\w*",
+    r"хоч\w*\s*зник\w*",
+    r"суїцид\w*|суицид\w*|самогубств\w*|самоубийств\w*",
+    r"(по)?кінч\w*\s*(із|з|с)\s*(соб|жит)\w*",
+    r"(по)?конч\w*\s*(с)\s*(соб|жиз)\w*",
+    r"вбит\w*\s*себе|убит\w*\s*себя",
+    r"нема\w*\s*сенс\w*\s*жи\w*",
+    r"нет\s*смысла\s*жи\w*",
+    r"(всім|всем)\s*.{0,15}(краще|лучше)\s*без\s*мен\w*",
+    r"(краще|лучше)\s*(б|бы)\s*мен\w*\s*не\s*бул\w*",
+    r"я\s*(всім|всем)\s*(тягар|обуза)",
+    r"сил\w*\s*(більше\s*|вже\s*)?нема\w*\s*жи\w*",
+    r"не\s*бач\w*\s*сенс\w*\s*(далі|дальше|жи)\w*",
+    r"хоч\w*\s*щоб\s*(це|всё|все)\s*.{0,15}(закінч|кончил)\w*\s*назавжди",
+    r"втом\w*\s*жи\w*|устал\w*\s*жи\w*",
+]
+
+SELF_HARM_PATTERNS = [
+    r"(зроб|сдел)\w*\s*соб[іе]\s*боля\w*",
+    r"(по)?р[іи]з\w*\s*себе|(по)?рез\w*\s*себя",
+    r"(вдар|удар)\w*\s*себе|себя",
+    r"шрам\w*\s*на\s*рук\w*",
+    r"(на)?шкод\w*\s*соб[іе]",
+    r"каліч\w*\s*себе|калеч\w*\s*себя",
+    r"self.?harm|селфхарм",
+]
+
+VIOLENCE_PATTERNS = [
+    r"(він|он|чоловік|муж|батько|отец|партнер)\s*.{0,20}(б'є|бье|бив|бил|вдар|удар|душ|штовх)\w*",
+    r"(вона|она)\s*.{0,20}(б'є|бье|била|вдар|удар)\w*",
+    r"мене\s*(б'ют|бьют|б'є|бье|побил|побив)\w*",
+    r"меня\s*(бьют|бьет|избил|ударил)\w*",
+    r"домашн\w*\s*насильств\w*|домашн\w*\s*насили\w*",
+    r"(з|)ґвалт\w*|изнасилов\w*",
+    r"бо[їю]с\w*\s*(його|ее|її|нього|повернен)\w*\s*додому",
+    r"він\s*.{0,15}(погрожу|загрожу)\w*|он\s*.{0,15}(угрожа)\w*",
+]
+
+_SUICIDE_RE = [re.compile(p, re.IGNORECASE) for p in SUICIDE_PATTERNS]
+_SELF_HARM_RE = [re.compile(p, re.IGNORECASE) for p in SELF_HARM_PATTERNS]
+_VIOLENCE_RE = [re.compile(p, re.IGNORECASE) for p in VIOLENCE_PATTERNS]
+
+CLASSIFIER_PROMPT = """Ти — класифікатор безпеки. Твоє єдине завдання: визначити, чи містить повідомлення маркери кризового стану.
+Категорії:
+- suicide: думки про те, щоб померти, зникнути, припинити життя
+- self_harm: наміри або опис заподіяння собі фізичної шкоди
+- violence: людина є об'єктом фізичного або сексуального насильства
+- none: жодного з перерахованого
+Важливо:
+- Класифікуй НАМІР, а не окремі слова. "Я вбив би за каву" — none.
+- Сильний біль, втома, розпач БЕЗ згадки про смерть або шкоду — none.
+- Сумніваєшся між категорією і none — обирай категорію.
+Відповідай ТІЛЬКИ валідним JSON: {"category": "suicide|self_harm|violence|none", "confidence": 0.0-1.0}"""
+
+def _regex_check(text):
+    t = text.lower()
+    if any(r.search(t) for r in _SUICIDE_RE):
+        return "suicide"
+    if any(r.search(t) for r in _SELF_HARM_RE):
+        return "self_harm"
+    if any(r.search(t) for r in _VIOLENCE_RE):
+        return "violence"
+    return None
+
+def _llm_check(text):
     try:
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
+        r = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ти строгий лінгвістичний асистент який витягує з тексту "
-                        "тільки справжні особисті імена людей.\n\n"
-                        "Правила:\n"
-                        "1. Ігноруй звичайні слова (Страшно, Зима, Добре, Погано).\n"
-                        "2. Якщо немає явного імені — поверни None.\n"
-                        "3. Видавай тільки саме ім'я з великої літери, без лапок."
-                    )
-                },
-                {"role": "user", "content": text}
+                {"role": "system", "content": CLASSIFIER_PROMPT},
+                {"role": "user", "content": text[:1000]},
             ],
-            max_tokens=10,
-            temperature=0
+            max_tokens=40,
+            temperature=0,
+            response_format={"type": "json_object"},
         )
-        name = response.choices[0].message.content.strip()
-        if name.lower() == "none" or not name:
-            return None
-        return name
+        data = json.loads(r.choices[0].message.content)
+        cat = data.get("category")
+        conf = float(data.get("confidence", 0))
+        if cat in ("suicide", "self_harm", "violence") and conf >= 0.5:
+            return cat
+        return None
     except:
         return None
+
+def detect_crisis(text):
+    hit = _regex_check(text)
+    if hit:
+        return hit
+    if len(text.strip()) > 3:
+        return _llm_check(text)
+    return None
+
+CRISIS_REPLIES = {
+    "suicide": (
+        "Я бачу, що тобі зараз неймовірно важко. Дякую, що написав(ла) про це.\n\n"
+        "Будь ласка, зателефонуй — тебе вислухають:\n\n"
+        "📞 7333 — Lifeline Ukraine (цілодобово, безкоштовно)\n"
+        "📞 116 123 — Національна гаряча лінія\n"
+        "📞 1545 — Урядова гаряча лінія\n"
+        "📞 112 — Екстрена допомога\n\n"
+        "Ти важлива людина. Розкажи мені що зараз відбувається? Я тут. 💙"
+    ),
+    "self_harm": (
+        "Я чую, що тобі зараз дуже боляче. Дякую, що сказав(ла) про це.\n\n"
+        "Будь ласка, не залишайся з цим наодинці:\n\n"
+        "📞 7333 — Lifeline Ukraine (цілодобово, безкоштовно)\n"
+        "📞 116 123 — Національна гаряча лінія\n\n"
+        "Розкажи мені що зараз відбувається? Я тут. 💙"
+    ),
+    "violence": (
+        "Те, про що ти зараз пишеш — серйозно. І добре, що ти це сказав(ла).\n\n"
+        "Ти не мусиш бути з цим наодинці:\n\n"
+        "📞 116 123 — Національна лінія (насильство, цілодобово, безкоштовно)\n"
+        "📞 1547 — Урядова лінія підтримки\n"
+        "📞 102 — Поліція (якщо є безпосередня загроза)\n\n"
+        "Якщо ти зараз у небезпеці — зателефонуй або вийди в безпечне місце. 💙"
+    ),
+}
+
+MIN_MESSAGES_BEFORE_EXIT = 8
+MIN_MINUTES_BEFORE_EXIT = 20
+STABLE_MESSAGES_REQUIRED = 4
+
+class CrisisState:
+    def __init__(self):
+        self.active = False
+        self.entered_at = None
+        self.messages_since = 0
+        self.stable_streak = 0
+        self.category = None
+
+    def enter(self, category):
+        self.active = True
+        self.category = category
+        self.entered_at = datetime.now()
+        self.messages_since = 0
+        self.stable_streak = 0
+
+    def register_message(self, had_marker):
+        if not self.active:
+            return
+        self.messages_since += 1
+        if had_marker:
+            self.stable_streak = 0
+            self.entered_at = datetime.now()
+        else:
+            self.stable_streak += 1
+
+    def can_exit(self):
+        if not self.active:
+            return False
+        if self.messages_since < MIN_MESSAGES_BEFORE_EXIT:
+            return False
+        if self.stable_streak < STABLE_MESSAGES_REQUIRED:
+            return False
+        minutes = (datetime.now() - self.entered_at).total_seconds() / 60
+        return minutes >= MIN_MINUTES_BEFORE_EXIT
+
+    def exit(self):
+        self.active = False
+        self.category = None
+        self.stable_streak = 0
+
+# ============ РОЗПІЗНАВАННЯ ДАНИХ ============
 
 def extract_user_info(text, user_data):
     text_lower = text.lower().strip()
@@ -200,20 +355,14 @@ def extract_user_info(text, user_data):
         r'я\s+(\w+)$',
         r'я\s+(\w+),',
     ]
-
     if not user_data.get("name"):
-        found_name = None
         for pattern in name_patterns:
             match = re.search(pattern, text_lower)
             if match:
                 name = match.group(1).capitalize()
                 if len(name) > 1:
-                    found_name = name
+                    user_data["name"] = name
                     break
-        if not found_name and len(text.split()) <= 3:
-            found_name = extract_name_with_openai(text)
-        if found_name:
-            user_data["name"] = found_name
 
     age_match = re.search(r'\b(\d{1,2})\s*(рік|років|года|лет|год|роки)\b', text_lower)
     if age_match and not user_data.get("age"):
@@ -245,11 +394,12 @@ def extract_user_info(text, user_data):
                 "єлизавета", "віка", "вікторія", "даша", "дарина", "настя",
                 "анастасія", "маша", "марина", "галя", "галина", "лара", "лариса",
                 "жанна", "діана", "аліна", "інна", "вера", "лілія", "христина",
+                "ксенія", "ксения", "карина", "іринa", "ирина", "катжа",
             ]
             if name in female_names:
                 user_data["gender"] = "Жінка"
 
-    BAD_LOCATIONS = ["нашим", "мною", "тобою", "ним", "нею", "нами", "мене", "тебе", "його", "неї", "страшно", "важко"]
+    BAD_LOCATIONS = ["нашим", "мною", "тобою", "ним", "нею", "нами", "мене", "тебе", "страшно", "важко"]
     location_patterns = [
         r'живу в\s+(\w+)',
         r'нахожусь в\s+(\w+)',
@@ -351,35 +501,16 @@ BUTTON_NAMES = {
     "lost": "Втрата опори",
 }
 
-CRISIS_KEYWORDS = [
-    "суїцид", "самогубство", "вбити себе", "убить себя",
-    "не хочу жити", "не хочу жить", "хочу умереть", "хочу померти",
-    "покончить с жизнью", "покінчити з життям", "покінчити життя",
-    "кончаю з собою", "нет смысла жить", "немає сенсу жити",
-    "всем будет лучше без меня", "всім буде краще без мене",
-    "краще б мене не було", "лучше бы меня не було",
-    "я всім тягар", "я всем обуза",
-    "хочу щоб це закінчилось назавжди",
-]
-
-VIOLENCE_KEYWORDS = [
-    "він мене б'є", "она меня бьет", "він мене вдарив", "он меня ударил",
-    "домашнє насильство", "домашнее насилие",
-    "изнасилование", "зґвалтування",
-]
-
-SELF_HARM_KEYWORDS = [
-    "зроблю собі боляче", "порізати себе", "порезать себя",
-    "вдарити себе", "ударить себя",
-    "шрами на руках", "шрамы на руках",
-]
+# ============ СТАН ============
 
 user_sessions = {}
-crisis_users = set()
+crisis_states = {}
 user_last_button = {}
 user_session_start = {}
 user_message_count = {}
 user_data_store = {}
+
+# ============ ПРОМПТИ ============
 
 SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний ШІ-компаньйон у підході ACT.
 
@@ -397,9 +528,7 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 - Повторювати одне й те саме питання двічі
 - Згадувати гарячі лінії при звичайних зверненнях
 
-ГАРЯЧІ ЛІНІЇ — ТІЛЬКИ КОЛИ:
-- Людина сама просить гарячу лінію або психолога
-- Спрацювали кризові слова
+ГАРЯЧІ ЛІНІЇ — ТІЛЬКИ КОЛИ людина сама просить або кризові слова.
 У всіх інших випадках — НЕ згадуй гарячі лінії взагалі.
 
 ДАВАЙ ТЕХНІКУ ОДРАЗУ:
@@ -424,17 +553,17 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 
 ІМ'Я ТА РІД:
 - Тільки ім'я з контексту або що людина сама написала
-- НЕ вигадуй і НЕ скорочуй — Mary це Mary
-- НЕ питай якщо ім'я вже є
+- НЕ вигадуй і НЕ скорочуй
 - Жіночі → зробила, відчула
 - Чоловічі → зробив, відчув
+- Не зрозуміло → "Як правильно — ти зробив чи зробила?"
 
-ГОРЕ: "хтось помер", "він загинув" → НЕ давай вправ. "Мені дуже шкода. Це величезна втрата."
+ГОРЕ: НЕ давай вправ. "Мені дуже шкода. Це величезна втрата."
 НІКОЛИ: "час лікує", "він в кращому місці"
 
-ПІДТРИМКА ДОГЛЯДАЧІВ: "чоловік на фронті", "дитина хворіє", "все на мені" → "Коли несеш стільки — хто зараз піклується про тебе?"
+ПІДТРИМКА ДОГЛЯДАЧІВ: → "Коли несеш стільки — хто зараз піклується про тебе?"
 
-ПІСЛЯ ВПРАВИ: "Спробувала? Що помітила?"
+ПІСЛЯ ВПРАВИ: "Спробував(ла)? Що помітив(ла)?"
 
 ЗАВЕРШЕННЯ:
 "дякую", "стало краще" → "Радий що трохи легше. Повертайся коли потрібно. 💙"
@@ -442,20 +571,18 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 "все", "ладно" → "Як ти зараз? Є що ще на серці?" """
 
 SYSTEM_PROMPT_CRISIS = """Ти — Максим, теплий та надзвичайно емпатичний психологічний помічник.
-
 Користувач перебуває у гострому кризовому стані.
-
 ФОРМАТ: Простий текст БЕЗ зірочок.
-
-ВАЖЛИВО:
 - Не проводь вправ якщо не просить
 - Якщо просить — дай одну просту (дихання або 5-4-3-2-1)
 - Не заспокоюй формулами
-- М'яко заохочуй зателефонувати: 7333, 116 123, 1545
+- М'яко заохочуй: 7333, 116 123, 1545
 - Коротко і дбайливо
 - Дзеркаль мову
 - Не питай про спосіб чи план
 - Не повторюй одне й те саме"""
+
+# ============ КЛАВІАТУРА ============
 
 def get_main_keyboard():
     keyboard = [
@@ -468,6 +595,8 @@ def get_main_keyboard():
         [InlineKeyboardButton("😵 Втрата опори", callback_data="lost")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+# ============ ХЕНДЛЕРИ ============
 
 async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Maksym Bot v{VERSION}")
@@ -486,14 +615,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hour = datetime.now().strftime("%H:00")
     if user.id not in user_data_store:
         user_data_store[user.id] = {}
-    try:
-        log_event("START", user.id, user.username or "", user.first_name or "", user.language_code or "", hour)
-    except:
-        pass
+    if user.id not in crisis_states:
+        crisis_states[user.id] = CrisisState()
+    log_event("START", user.id, user.username or "", user.first_name or "", user.language_code or "", hour)
     try:
         update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", user_data_store[user.id], is_start=True)
-    except:
-        pass
+    except Exception as e:
+        print(f"START update_user_record ERROR: {e}")
     await update.message.reply_text(
         "Привіт 👋\n\nЯ тут, щоб підтримати тебе. Як ти зараз почуваєшся?",
         reply_markup=get_main_keyboard()
@@ -515,14 +643,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_session_start[user.id] = datetime.now()
         user_message_count[user.id] = 0
         last_button = user_last_button.get(user.id, "—")
-        udata = user_data_store.get(user.id, {})
-        try:
-            log_event("MAKSYM_START", user.id, user.username or "", user.first_name or "",
-                      user.language_code or "", hour, extra=f"Прийшов з: {last_button}",
-                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                      age=udata.get("age", ""), location=udata.get("location", ""))
-        except:
-            pass
+        log_event("MAKSYM_START", user.id, user.username or "", user.first_name or "",
+                  user.language_code or "", hour, last_button=last_button)
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await query.message.reply_text(
             "Привіт, я Максим 👋\n\nРозкажи мені що тебе турбує. Я тут, щоб вислухати.",
@@ -532,14 +654,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     button_name = BUTTON_NAMES.get(query.data, query.data)
     user_last_button[user.id] = button_name
-    udata = user_data_store.get(user.id, {})
-    try:
-        log_event(f"BUTTON: {button_name}", user.id, user.username or "", user.first_name or "",
-                  user.language_code or "", hour,
-                  user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                  age=udata.get("age", ""), location=udata.get("location", ""))
-    except:
-        pass
+    log_event(f"BUTTON: {button_name}", user.id, user.username or "", user.first_name or "",
+              user.language_code or "", hour)
 
     text = MESSAGES.get(query.data, "")
     keyboard = [
@@ -551,85 +667,42 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     hour = datetime.now().strftime("%H:00")
-    text_lower = update.message.text.lower()
 
     if user.id not in user_data_store:
         user_data_store[user.id] = {}
+    if user.id not in crisis_states:
+        crisis_states[user.id] = CrisisState()
 
-    prev_data = dict(user_data_store[user.id])
     user_data_store[user.id] = extract_user_info(update.message.text, user_data_store[user.id])
     udata = user_data_store[user.id]
+    crisis = crisis_states[user.id]
 
-    if udata != prev_data:
-        try:
-            update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", udata)
-        except:
-            pass
+    # Детекція кризи
+    crisis_type = detect_crisis(update.message.text)
 
-    if any(word in text_lower for word in VIOLENCE_KEYWORDS):
-        crisis_users.add(user.id)
+    if crisis_type:
+        if not crisis.active:
+            crisis.enter(crisis_type)
+        else:
+            crisis.register_message(had_marker=True)
+
         if user.id not in user_sessions:
             user_sessions[user.id] = []
-        try:
-            log_event("VIOLENCE", user.id, user.username or "", user.first_name or "",
-                      user.language_code or "", hour,
-                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                      age=udata.get("age", ""), location=udata.get("location", ""))
-        except:
-            pass
-        await update.message.reply_text(
-            "Те, що ти зараз кажеш — серйозно, і добре, що ти це сказала.\n\n"
-            "Ти не мусиш бути з цим наодинці:\n\n"
-            "📞 116 123 — Національна лінія (насильство, цілодобово, безкоштовно)\n"
-            "📞 1547 — Урядова лінія підтримки\n"
-            "📞 102 — Поліція (якщо є безпосередня загроза)\n\n"
-            "Якщо ти зараз у небезпеці — зателефонуй або вийди в безпечне місце. 💙"
-        )
+
+        log_event(crisis_type.upper(), user.id, user.username or "", user.first_name or "",
+                  user.language_code or "", hour)
+
+        reply_text = CRISIS_REPLIES.get(crisis_type, CRISIS_REPLIES["suicide"])
+        await update.message.reply_text(reply_text)
         return
 
-    if any(word in text_lower for word in SELF_HARM_KEYWORDS):
-        crisis_users.add(user.id)
-        if user.id not in user_sessions:
-            user_sessions[user.id] = []
-        try:
-            log_event("SELF_HARM", user.id, user.username or "", user.first_name or "",
-                      user.language_code or "", hour,
-                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                      age=udata.get("age", ""), location=udata.get("location", ""))
-        except:
-            pass
-        await update.message.reply_text(
-            "Я чую, що тобі зараз дуже боляче. Дякую, що сказала про це.\n\n"
-            "Будь ласка, не залишайся з цим сам на сам:\n\n"
-            "📞 7333 — Lifeline Ukraine (цілодобово, безкоштовно)\n"
-            "📞 116 123 — Національна гаряча лінія\n\n"
-            "Розкажи мені що зараз відбувається? Я тут. 💙"
-        )
-        return
+    # Якщо в кризовому режимі
+    if crisis.active:
+        crisis.register_message(had_marker=False)
+        if crisis.can_exit():
+            crisis.exit()
 
-    if any(word in text_lower for word in CRISIS_KEYWORDS):
-        crisis_users.add(user.id)
-        if user.id not in user_sessions:
-            user_sessions[user.id] = []
-        try:
-            log_event("CRISIS", user.id, user.username or "", user.first_name or "",
-                      user.language_code or "", hour,
-                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                      age=udata.get("age", ""), location=udata.get("location", ""))
-        except:
-            pass
-        await update.message.reply_text(
-            "Я бачу, що тобі зараз неймовірно важко. Дякую, що не залишилася з цим наодинці.\n\n"
-            "Будь ласка, зателефонуй — тебе вислухають:\n\n"
-            "📞 7333 — Lifeline Ukraine (цілодобово, безкоштовно)\n"
-            "📞 116 123 — Національна гаряча лінія\n"
-            "📞 1545 — Урядова гаряча лінія\n"
-            "📞 112 — Екстрена допомога\n\n"
-            "Ти важлива. Розкажи мені що зараз відбувається? Я тут. 💙"
-        )
-        return
-
-    if user.id not in user_sessions and user.id not in crisis_users:
+    if user.id not in user_sessions and not crisis.active:
         await update.message.reply_text(
             "Як ти зараз почуваєшся?",
             reply_markup=get_main_keyboard()
@@ -638,11 +711,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user.id not in user_sessions:
         user_sessions[user.id] = []
-
-    if user.id in crisis_users:
-        count = user_message_count.get(user.id, 0)
-        if count >= 3 and not any(word in text_lower for word in CRISIS_KEYWORDS + SELF_HARM_KEYWORDS + VIOLENCE_KEYWORDS):
-            crisis_users.discard(user.id)
 
     history = user_sessions.get(user.id, [])
     history.append({"role": "user", "content": update.message.text})
@@ -653,9 +721,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = user_message_count.get(user.id, 0)
     start_time = user_session_start.get(user.id)
     duration = int((datetime.now() - start_time).total_seconds() / 60) if start_time else 0
-    extra = f"Повідомлень: {count}, Тривалість: {duration} хв"
+    last_button = user_last_button.get(user.id, "—")
 
-    system_prompt = SYSTEM_PROMPT_CRISIS if user.id in crisis_users else SYSTEM_PROMPT_NORMAL
+    system_prompt = SYSTEM_PROMPT_CRISIS if crisis.active else SYSTEM_PROMPT_NORMAL
 
     user_context = ""
     if udata.get("name"):
@@ -670,12 +738,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         system_prompt = system_prompt + f"\n\nКОНТЕКСТ: {user_context}"
 
     extra_question = ""
-    if count == 3 and not udata.get("name") and user.id not in crisis_users:
+    if count == 3 and not udata.get("name") and not crisis.active:
         extra_question = "\n\nДо речі, як тебе звати?"
-    elif count == 5 and not udata.get("age") and user.id not in crisis_users:
+    elif count == 5 and not udata.get("age") and not crisis.active:
         extra_question = "\n\nСкільки тобі років? Щоб краще розуміти твою ситуацію."
-    elif count == 7 and not udata.get("location") and user.id not in crisis_users:
-        extra_question = "\n\nТи зараз в Україні чи за кордоном?"
 
     try:
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -696,17 +762,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history.append({"role": "assistant", "content": reply})
         user_sessions[user.id] = history
 
-        try:
-            log_event("MAKSYM_MESSAGE", user.id, user.username or "", user.first_name or "",
-                      user.language_code or "", hour, extra=extra,
-                      user_name_given=udata.get("name", ""), gender=udata.get("gender", ""),
-                      age=udata.get("age", ""), location=udata.get("location", ""))
-        except:
-            pass
+        log_event("MAKSYM_MESSAGE", user.id, user.username or "", user.first_name or "",
+                  user.language_code or "", hour,
+                  last_button=last_button,
+                  msg_count=count,
+                  duration=duration)
 
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
+        print(f"GPT ERROR: {e}")
         await update.message.reply_text("Вибач, сталася помилка. Спробуй ще раз.")
 
 def main():
