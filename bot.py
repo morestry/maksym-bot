@@ -1,11 +1,9 @@
 # ============================================
 # MAKSYM BOT
-# Версія: 2.5
+# Версія: 2.6
 # Дата: 2026-09-19
-# Зміни: новий кризовий модуль (regex+GPT),
-#        виправлено Лист1 (окреме з'єднання),
-#        update_user_record тільки при START,
-#        гендерно-нейтральні відповіді,
+# Зміни: тільки Лист1, без update_user_record,
+#        новий кризовий модуль (regex+GPT),
 #        вихід з кризи: 8 повід + 20 хв
 # ============================================
 
@@ -24,38 +22,19 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
-VERSION = "2.5 | 2026-09-19"
+VERSION = "2.6 | 2026-09-19"
 
 # ============ GOOGLE SHEETS ============
 
-def _get_client():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    return gspread.authorize(creds)
-
 def get_sheet():
     try:
-        return _get_client().open_by_key(GOOGLE_SHEET_ID).sheet1
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client.open_by_key(GOOGLE_SHEET_ID).sheet1
     except Exception as e:
         print(f"GET_SHEET ERROR: {e}")
-        return None
-
-def get_users_sheet():
-    try:
-        spreadsheet = _get_client().open_by_key(GOOGLE_SHEET_ID)
-        try:
-            return spreadsheet.worksheet("Користувачі")
-        except:
-            sheet = spreadsheet.add_worksheet(title="Користувачі", rows=1000, cols=12)
-            sheet.append_row([
-                "ID", "Username", "Ім'я (TG)", "Ім'я (назвав сам)",
-                "Стать", "Вік", "Місто", "Мова", "Перший візит",
-                "Останній візит", "Всього сесій", "Повідомлень Максиму"
-            ], value_input_option="RAW")
-            return sheet
-    except Exception as e:
-        print(f"GET_USERS_SHEET ERROR: {e}")
         return None
 
 def log_event(event_type, user_id, username="", first_name="", language="",
@@ -66,8 +45,6 @@ def log_event(event_type, user_id, username="", first_name="", language="",
             return
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_anon = "Анонім" if not username else "Є username"
-        weekday_ua = get_weekday_ua()
-        time_of_day = get_time_of_day()
         row = [
             now,
             event_type,
@@ -77,8 +54,8 @@ def log_event(event_type, user_id, username="", first_name="", language="",
             str(language),
             str(hour),
             is_anon,
-            weekday_ua,
-            time_of_day,
+            get_weekday_ua(),
+            get_time_of_day(),
             str(last_button),
             str(msg_count),
             str(duration),
@@ -86,61 +63,6 @@ def log_event(event_type, user_id, username="", first_name="", language="",
         sheet.append_row(row, value_input_option="RAW")
     except Exception as e:
         print(f"LOG_EVENT ERROR: {e}")
-
-def update_user_record(user_id, username, first_name, language, udata, is_start=False):
-    try:
-        sheet = get_users_sheet()
-        if not sheet:
-            return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        all_records = sheet.get_all_values()
-        user_row = None
-        for i, row in enumerate(all_records):
-            if row and str(row[0]) == str(user_id):
-                user_row = i + 1
-                break
-
-        def safe_int(val):
-            try:
-                return int(str(val).strip())
-            except:
-                return 0
-
-        def best(new_val, old_val):
-            return new_val if new_val else old_val
-
-        if user_row:
-            existing = all_records[user_row - 1]
-            while len(existing) < 12:
-                existing.append("")
-            sessions = safe_int(existing[10])
-            messages = safe_int(existing[11])
-            if is_start:
-                sessions += 1
-            else:
-                messages += 1
-            new_values = [[
-                username, first_name,
-                best(udata.get("name", ""), existing[3]),
-                best(udata.get("gender", ""), existing[4]),
-                best(udata.get("age", ""), existing[5]),
-                best(udata.get("location", ""), existing[6]),
-                language,
-                existing[8] if existing[8] else now,
-                now, sessions, messages,
-            ]]
-            sheet.update(values=new_values, range_name=f"B{user_row}:L{user_row}")
-        else:
-            sheet.append_row([
-                str(user_id), username, first_name,
-                udata.get("name", ""), udata.get("gender", ""),
-                udata.get("age", ""), udata.get("location", ""),
-                language, now, now,
-                1 if is_start else 0,
-                0 if is_start else 1,
-            ], value_input_option="RAW")
-    except Exception as e:
-        print(f"UPDATE_USER ERROR: {e}")
 
 # ============ ДОПОМІЖНІ ============
 
@@ -189,7 +111,6 @@ SUICIDE_PATTERNS = [
     r"(всім|всем)\s*.{0,15}(краще|лучше)\s*без\s*мен\w*",
     r"(краще|лучше)\s*(б|бы)\s*мен\w*\s*не\s*бул\w*",
     r"я\s*(всім|всем)\s*(тягар|обуза)",
-    r"сил\w*\s*(більше\s*|вже\s*)?нема\w*\s*жи\w*",
     r"не\s*бач\w*\s*сенс\w*\s*(далі|дальше|жи)\w*",
     r"хоч\w*\s*щоб\s*(це|всё|все)\s*.{0,15}(закінч|кончил)\w*\s*назавжди",
     r"втом\w*\s*жи\w*|устал\w*\s*жи\w*",
@@ -220,17 +141,15 @@ _SUICIDE_RE = [re.compile(p, re.IGNORECASE) for p in SUICIDE_PATTERNS]
 _SELF_HARM_RE = [re.compile(p, re.IGNORECASE) for p in SELF_HARM_PATTERNS]
 _VIOLENCE_RE = [re.compile(p, re.IGNORECASE) for p in VIOLENCE_PATTERNS]
 
-CLASSIFIER_PROMPT = """Ти — класифікатор безпеки. Твоє єдине завдання: визначити, чи містить повідомлення маркери кризового стану.
+CLASSIFIER_PROMPT = """Ти — класифікатор безпеки. Визнач чи містить повідомлення маркери кризового стану.
 Категорії:
-- suicide: думки про те, щоб померти, зникнути, припинити життя
-- self_harm: наміри або опис заподіяння собі фізичної шкоди
-- violence: людина є об'єктом фізичного або сексуального насильства
+- suicide: думки про смерть, зникнути, припинити життя
+- self_harm: наміри заподіяти собі фізичну шкоду
+- violence: людина є об'єктом насильства або погроз
 - none: жодного з перерахованого
-Важливо:
-- Класифікуй НАМІР, а не окремі слова. "Я вбив би за каву" — none.
-- Сильний біль, втома, розпач БЕЗ згадки про смерть або шкоду — none.
-- Сумніваєшся між категорією і none — обирай категорію.
-Відповідай ТІЛЬКИ валідним JSON: {"category": "suicide|self_harm|violence|none", "confidence": 0.0-1.0}"""
+Класифікуй НАМІР. "Я вбив би за каву" — none.
+Сумніваєшся — обирай категорію.
+Відповідай ТІЛЬКИ JSON: {"category": "suicide|self_harm|violence|none", "confidence": 0.0-1.0}"""
 
 def _regex_check(text):
     t = text.lower()
@@ -394,32 +313,10 @@ def extract_user_info(text, user_data):
                 "єлизавета", "віка", "вікторія", "даша", "дарина", "настя",
                 "анастасія", "маша", "марина", "галя", "галина", "лара", "лариса",
                 "жанна", "діана", "аліна", "інна", "вера", "лілія", "христина",
-                "ксенія", "ксения", "карина", "іринa", "ирина", "катжа",
+                "ксенія", "ксения", "карина", "іринa", "ирина",
             ]
             if name in female_names:
                 user_data["gender"] = "Жінка"
-
-    BAD_LOCATIONS = ["нашим", "мною", "тобою", "ним", "нею", "нами", "мене", "тебе", "страшно", "важко"]
-    location_patterns = [
-        r'живу в\s+(\w+)',
-        r'нахожусь в\s+(\w+)',
-        r'знаходжусь в\s+(\w+)',
-        r'перебуваю в\s+(\w+)',
-        r'я зараз в\s+(\w+)',
-        r'я з\s+(\w+)',
-    ]
-    if not user_data.get("location"):
-        for pattern in location_patterns:
-            match = re.search(pattern, text_lower)
-            if match:
-                loc = match.group(1).capitalize()
-                if loc.lower() not in BAD_LOCATIONS and len(loc) > 2:
-                    user_data["location"] = loc
-                break
-        if "за кордоном" in text_lower or "заграницей" in text_lower:
-            user_data["location"] = "За кордоном"
-        elif "в україні" in text_lower or "в украине" in text_lower:
-            user_data["location"] = "Україна"
 
     return user_data
 
@@ -529,7 +426,6 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 - Згадувати гарячі лінії при звичайних зверненнях
 
 ГАРЯЧІ ЛІНІЇ — ТІЛЬКИ КОЛИ людина сама просить або кризові слова.
-У всіх інших випадках — НЕ згадуй гарячі лінії взагалі.
 
 ДАВАЙ ТЕХНІКУ ОДРАЗУ:
 "не можу уснуть", "думки не дають спати" → "Вдих 4 секунди, затримай 7, видих 8. Повтори 4 рази. Відклади телефон."
@@ -618,10 +514,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id not in crisis_states:
         crisis_states[user.id] = CrisisState()
     log_event("START", user.id, user.username or "", user.first_name or "", user.language_code or "", hour)
-    try:
-        update_user_record(user.id, user.username or "", user.first_name or "", user.language_code or "", user_data_store[user.id], is_start=True)
-    except Exception as e:
-        print(f"START update_user_record ERROR: {e}")
     await update.message.reply_text(
         "Привіт 👋\n\nЯ тут, щоб підтримати тебе. Як ти зараз почуваєшся?",
         reply_markup=get_main_keyboard()
@@ -677,7 +569,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     udata = user_data_store[user.id]
     crisis = crisis_states[user.id]
 
-    # Детекція кризи
     crisis_type = detect_crisis(update.message.text)
 
     if crisis_type:
@@ -685,18 +576,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             crisis.enter(crisis_type)
         else:
             crisis.register_message(had_marker=True)
-
         if user.id not in user_sessions:
             user_sessions[user.id] = []
-
         log_event(crisis_type.upper(), user.id, user.username or "", user.first_name or "",
                   user.language_code or "", hour)
-
-        reply_text = CRISIS_REPLIES.get(crisis_type, CRISIS_REPLIES["suicide"])
-        await update.message.reply_text(reply_text)
+        await update.message.reply_text(CRISIS_REPLIES.get(crisis_type, CRISIS_REPLIES["suicide"]))
         return
 
-    # Якщо в кризовому режимі
     if crisis.active:
         crisis.register_message(had_marker=False)
         if crisis.can_exit():
@@ -732,8 +618,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_context += f"Стать: {udata['gender']}. "
     if udata.get("age"):
         user_context += f"Вік: {udata['age']} років. "
-    if udata.get("location"):
-        user_context += f"Місто/країна: {udata['location']}. "
     if user_context:
         system_prompt = system_prompt + f"\n\nКОНТЕКСТ: {user_context}"
 
