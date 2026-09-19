@@ -1,10 +1,11 @@
 # ============================================
 # MAKSYM BOT
-# Версія: 2.6
+# Версія: 2.7
 # Дата: 2026-09-19
-# Зміни: тільки Лист1, без update_user_record,
-#        новий кризовий модуль (regex+GPT),
-#        вихід з кризи: 8 повід + 20 хв
+# База: версія що працювала до 23:04 16.09
+# Зміни: webhook замість polling,
+#        кешований Sheets клієнт,
+#        новий кризовий модуль
 # ============================================
 
 import os
@@ -21,20 +22,29 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+PORT = int(os.environ.get("PORT", 8443))
 
-VERSION = "2.6 | 2026-09-19"
+VERSION = "2.7 | 2026-09-19"
 
-# ============ GOOGLE SHEETS ============
+# ============ GOOGLE SHEETS (кешований клієнт) ============
+
+_sheet_cache = None
 
 def get_sheet():
+    global _sheet_cache
     try:
+        if _sheet_cache is not None:
+            return _sheet_cache
         creds_dict = json.loads(GOOGLE_CREDENTIALS)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
-        return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        _sheet_cache = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        return _sheet_cache
     except Exception as e:
         print(f"GET_SHEET ERROR: {e}")
+        _sheet_cache = None
         return None
 
 def log_event(event_type, user_id, username="", first_name="", language="",
@@ -61,8 +71,11 @@ def log_event(event_type, user_id, username="", first_name="", language="",
             str(duration),
         ]
         sheet.append_row(row, value_input_option="RAW")
+        print(f"LOG OK: {event_type} {user_id}")
     except Exception as e:
         print(f"LOG_EVENT ERROR: {e}")
+        global _sheet_cache
+        _sheet_cache = None
 
 # ============ ДОПОМІЖНІ ============
 
@@ -94,47 +107,87 @@ def clean_markdown(text):
     text = re.sub(r'#{1,6}\s', '', text)
     return text
 
+def extract_user_info(text, user_data):
+    text_lower = text.lower().strip()
+    name_patterns = [
+        r'мене звати\s+(\w+)',
+        r'мене зовуть\s+(\w+)',
+        r'меня зовут\s+(\w+)',
+        r'я\s+(\w+)$',
+        r'я\s+(\w+),',
+    ]
+    if not user_data.get("name"):
+        for pattern in name_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                name = match.group(1).capitalize()
+                if len(name) > 1:
+                    user_data["name"] = name
+                    break
+    age_match = re.search(r'\b(\d{1,2})\s*(рік|років|года|лет|год|роки)\b', text_lower)
+    if age_match and not user_data.get("age"):
+        age = int(age_match.group(1))
+        if 10 <= age <= 99:
+            user_data["age"] = str(age)
+    simple_age = re.search(r'^\s*(\d{1,2})\s*$', text.strip())
+    if simple_age and not user_data.get("age"):
+        age = int(simple_age.group(1))
+        if 10 <= age <= 99:
+            user_data["age"] = str(age)
+    female_indicators = ["я жінка", "я дівчина", "я мама", "я дружина", "я донька", "я сестра"]
+    male_indicators = ["я чоловік", "я хлопець", "я тато", "я муж", "я брат", "я син"]
+    if not user_data.get("gender"):
+        if any(w in text_lower for w in female_indicators):
+            user_data["gender"] = "Жінка"
+        elif any(w in text_lower for w in male_indicators):
+            user_data["gender"] = "Чоловік"
+        elif user_data.get("name"):
+            name = user_data["name"].lower()
+            female_names = [
+                "mary", "maria", "марія", "оля", "ольга", "катя", "катерина",
+                "аня", "анна", "таня", "тетяна", "наташа", "наталія", "лена",
+                "олена", "юля", "юлія", "іра", "ірина", "света", "світлана",
+                "люда", "людмила", "надя", "надія", "соня", "софія", "ліза",
+                "єлизавета", "віка", "вікторія", "даша", "дарина", "настя",
+                "анастасія", "маша", "марина", "галя", "галина", "лара", "лариса",
+                "жанна", "діана", "аліна", "інна", "вера", "лілія", "христина",
+                "ксенія", "ксения", "карина", "іринa", "ирина",
+            ]
+            if name in female_names:
+                user_data["gender"] = "Жінка"
+    return user_data
+
 # ============ КРИЗОВИЙ МОДУЛЬ ============
 
 SUICIDE_PATTERNS = [
     r"не\s*хоч\w*\s*(більше\s*|вже\s*|далі\s*)?жи\w*",
     r"жи\w*\s*не\s*хоч\w*",
     r"хоч\w*\s*(по)?мерт\w*",
-    r"хоч\w*\s*(по)?умерт\w*",
     r"хоч\w*\s*зник\w*",
     r"суїцид\w*|суицид\w*|самогубств\w*|самоубийств\w*",
     r"(по)?кінч\w*\s*(із|з|с)\s*(соб|жит)\w*",
-    r"(по)?конч\w*\s*(с)\s*(соб|жиз)\w*",
     r"вбит\w*\s*себе|убит\w*\s*себя",
-    r"нема\w*\s*сенс\w*\s*жи\w*",
-    r"нет\s*смысла\s*жи\w*",
+    r"нема\w*\s*сенс\w*\s*жи\w*|нет\s*смысла\s*жи\w*",
     r"(всім|всем)\s*.{0,15}(краще|лучше)\s*без\s*мен\w*",
     r"(краще|лучше)\s*(б|бы)\s*мен\w*\s*не\s*бул\w*",
     r"я\s*(всім|всем)\s*(тягар|обуза)",
-    r"не\s*бач\w*\s*сенс\w*\s*(далі|дальше|жи)\w*",
     r"хоч\w*\s*щоб\s*(це|всё|все)\s*.{0,15}(закінч|кончил)\w*\s*назавжди",
-    r"втом\w*\s*жи\w*|устал\w*\s*жи\w*",
 ]
 
 SELF_HARM_PATTERNS = [
     r"(зроб|сдел)\w*\s*соб[іе]\s*боля\w*",
     r"(по)?р[іи]з\w*\s*себе|(по)?рез\w*\s*себя",
-    r"(вдар|удар)\w*\s*себе|себя",
+    r"(вдар|удар)\w*\s*себе",
     r"шрам\w*\s*на\s*рук\w*",
-    r"(на)?шкод\w*\s*соб[іе]",
-    r"каліч\w*\s*себе|калеч\w*\s*себя",
     r"self.?harm|селфхарм",
 ]
 
 VIOLENCE_PATTERNS = [
-    r"(він|он|чоловік|муж|батько|отец|партнер)\s*.{0,20}(б'є|бье|бив|бил|вдар|удар|душ|штовх)\w*",
-    r"(вона|она)\s*.{0,20}(б'є|бье|била|вдар|удар)\w*",
+    r"(він|он|чоловік|муж|батько|партнер)\s*.{0,20}(б'є|бье|бив|бил|вдар|удар)\w*",
     r"мене\s*(б'ют|бьют|б'є|бье|побил|побив)\w*",
     r"меня\s*(бьют|бьет|избил|ударил)\w*",
     r"домашн\w*\s*насильств\w*|домашн\w*\s*насили\w*",
     r"(з|)ґвалт\w*|изнасилов\w*",
-    r"бо[їю]с\w*\s*(його|ее|її|нього|повернен)\w*\s*додому",
-    r"він\s*.{0,15}(погрожу|загрожу)\w*|он\s*.{0,15}(угрожа)\w*",
 ]
 
 _SUICIDE_RE = [re.compile(p, re.IGNORECASE) for p in SUICIDE_PATTERNS]
@@ -142,14 +195,10 @@ _SELF_HARM_RE = [re.compile(p, re.IGNORECASE) for p in SELF_HARM_PATTERNS]
 _VIOLENCE_RE = [re.compile(p, re.IGNORECASE) for p in VIOLENCE_PATTERNS]
 
 CLASSIFIER_PROMPT = """Ти — класифікатор безпеки. Визнач чи містить повідомлення маркери кризового стану.
-Категорії:
-- suicide: думки про смерть, зникнути, припинити життя
-- self_harm: наміри заподіяти собі фізичну шкоду
-- violence: людина є об'єктом насильства або погроз
-- none: жодного з перерахованого
-Класифікуй НАМІР. "Я вбив би за каву" — none.
-Сумніваєшся — обирай категорію.
-Відповідай ТІЛЬКИ JSON: {"category": "suicide|self_harm|violence|none", "confidence": 0.0-1.0}"""
+Категорії: suicide, self_harm, violence, none.
+Класифікуй НАМІР. "Я вбив би за каву" — none. Безглузді слова — none.
+Впевненість нижче 0.7 — none.
+JSON: {"category": "...", "confidence": 0.0-1.0}"""
 
 def _regex_check(text):
     t = text.lower()
@@ -168,7 +217,7 @@ def _llm_check(text):
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": CLASSIFIER_PROMPT},
-                {"role": "user", "content": text[:1000]},
+                {"role": "user", "content": text[:500]},
             ],
             max_tokens=40,
             temperature=0,
@@ -177,19 +226,19 @@ def _llm_check(text):
         data = json.loads(r.choices[0].message.content)
         cat = data.get("category")
         conf = float(data.get("confidence", 0))
-        if cat in ("suicide", "self_harm", "violence") and conf >= 0.5:
+        if cat in ("suicide", "self_harm", "violence") and conf >= 0.7:
             return cat
         return None
     except:
         return None
 
 def detect_crisis(text):
+    if len(text.strip()) < 3:
+        return None
     hit = _regex_check(text)
     if hit:
         return hit
-    if len(text.strip()) > 3:
-        return _llm_check(text)
-    return None
+    return _llm_check(text)
 
 CRISIS_REPLIES = {
     "suicide": (
@@ -217,10 +266,6 @@ CRISIS_REPLIES = {
         "Якщо ти зараз у небезпеці — зателефонуй або вийди в безпечне місце. 💙"
     ),
 }
-
-MIN_MESSAGES_BEFORE_EXIT = 8
-MIN_MINUTES_BEFORE_EXIT = 20
-STABLE_MESSAGES_REQUIRED = 4
 
 class CrisisState:
     def __init__(self):
@@ -250,75 +295,17 @@ class CrisisState:
     def can_exit(self):
         if not self.active:
             return False
-        if self.messages_since < MIN_MESSAGES_BEFORE_EXIT:
+        if self.messages_since < 8:
             return False
-        if self.stable_streak < STABLE_MESSAGES_REQUIRED:
+        if self.stable_streak < 4:
             return False
         minutes = (datetime.now() - self.entered_at).total_seconds() / 60
-        return minutes >= MIN_MINUTES_BEFORE_EXIT
+        return minutes >= 20
 
     def exit(self):
         self.active = False
         self.category = None
         self.stable_streak = 0
-
-# ============ РОЗПІЗНАВАННЯ ДАНИХ ============
-
-def extract_user_info(text, user_data):
-    text_lower = text.lower().strip()
-
-    name_patterns = [
-        r'мене звати\s+(\w+)',
-        r'мене зовуть\s+(\w+)',
-        r'меня зовут\s+(\w+)',
-        r'я\s+(\w+)$',
-        r'я\s+(\w+),',
-    ]
-    if not user_data.get("name"):
-        for pattern in name_patterns:
-            match = re.search(pattern, text_lower)
-            if match:
-                name = match.group(1).capitalize()
-                if len(name) > 1:
-                    user_data["name"] = name
-                    break
-
-    age_match = re.search(r'\b(\d{1,2})\s*(рік|років|года|лет|год|роки)\b', text_lower)
-    if age_match and not user_data.get("age"):
-        age = int(age_match.group(1))
-        if 10 <= age <= 99:
-            user_data["age"] = str(age)
-
-    simple_age = re.search(r'^\s*(\d{1,2})\s*$', text.strip())
-    if simple_age and not user_data.get("age"):
-        age = int(simple_age.group(1))
-        if 10 <= age <= 99:
-            user_data["age"] = str(age)
-
-    female_indicators = ["я жінка", "я дівчина", "я мама", "я дружина", "я донька", "я сестра"]
-    male_indicators = ["я чоловік", "я хлопець", "я тато", "я муж", "я брат", "я син"]
-
-    if not user_data.get("gender"):
-        if any(w in text_lower for w in female_indicators):
-            user_data["gender"] = "Жінка"
-        elif any(w in text_lower for w in male_indicators):
-            user_data["gender"] = "Чоловік"
-        elif user_data.get("name"):
-            name = user_data["name"].lower()
-            female_names = [
-                "mary", "maria", "марія", "оля", "ольга", "катя", "катерина",
-                "аня", "анна", "таня", "тетяна", "наташа", "наталія", "лена",
-                "олена", "юля", "юлія", "іра", "ірина", "света", "світлана",
-                "люда", "людмила", "надя", "надія", "соня", "софія", "ліза",
-                "єлизавета", "віка", "вікторія", "даша", "дарина", "настя",
-                "анастасія", "маша", "марина", "галя", "галина", "лара", "лариса",
-                "жанна", "діана", "аліна", "інна", "вера", "лілія", "христина",
-                "ксенія", "ксения", "карина", "іринa", "ирина",
-            ]
-            if name in female_names:
-                user_data["gender"] = "Жінка"
-
-    return user_data
 
 # ============ ТЕКСТИ КНОПОК ============
 
@@ -452,7 +439,6 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 - НЕ вигадуй і НЕ скорочуй
 - Жіночі → зробила, відчула
 - Чоловічі → зробив, відчув
-- Не зрозуміло → "Як правильно — ти зробив чи зробила?"
 
 ГОРЕ: НЕ давай вправ. "Мені дуже шкода. Це величезна втрата."
 НІКОЛИ: "час лікує", "він в кращому місці"
@@ -664,7 +650,18 @@ def main():
     app.add_handler(CommandHandler("version", version))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    if WEBHOOK_URL:
+        print(f"Starting webhook on port {PORT}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+        )
+    else:
+        print("Starting polling")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
