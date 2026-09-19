@@ -1,9 +1,10 @@
 # ============================================
 # MAKSYM BOT
-# Версія: 2.8
+# Версія: 2.9
 # Дата: 2026-09-19
-# Зміни: прибрано кешування get_sheet,
-#        кожен раз нове з'єднання з Sheets
+# Зміни: київський час (Europe/Kyiv),
+#        повернено update_user_record,
+#        table_range="A1" в log_event
 # ============================================
 
 import os
@@ -11,6 +12,7 @@ import json
 import re
 import openai
 import gspread
+import pytz
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -21,7 +23,11 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
-VERSION = "2.8 | 2026-09-19"
+VERSION = "2.9 | 2026-09-19"
+KYIV_TZ = pytz.timezone("Europe/Kyiv")
+
+def now_kyiv():
+    return datetime.now(KYIV_TZ)
 
 # ============ GOOGLE SHEETS ============
 
@@ -36,39 +42,114 @@ def get_sheet():
         print(f"GET_SHEET ERROR: {e}")
         return None
 
+def get_users_sheet():
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            return spreadsheet.worksheet("Користувачі")
+        except:
+            sheet = spreadsheet.add_worksheet(title="Користувачі", rows=1000, cols=12)
+            sheet.append_row([
+                "ID", "Username", "Ім'я (TG)", "Ім'я (назвав сам)",
+                "Стать", "Вік", "Місто", "Мова", "Перший візит",
+                "Останній візит", "Всього сесій", "Повідомлень Максиму"
+            ], value_input_option="RAW", table_range="A1")
+            return sheet
+    except Exception as e:
+        print(f"GET_USERS_SHEET ERROR: {e}")
+        return None
+
 def log_event(event_type, user_id, username="", first_name="", language="",
               hour="", last_button="", msg_count="", duration=""):
     try:
         sheet = get_sheet()
         if not sheet:
-            print(f"LOG SKIP: no sheet for {event_type}")
             return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = now_kyiv().strftime("%Y-%m-%d %H:%M:%S")
         is_anon = "Анонім" if not username else "Є username"
         row = [
             now,
             event_type,
             str(user_id),
-            str(username),
-            str(first_name),
-            str(language),
-            str(hour),
+            str(username or ""),
+            str(first_name or ""),
+            str(language or ""),
+            str(hour or ""),
             is_anon,
             get_weekday_ua(),
             get_time_of_day(),
-            str(last_button),
-            str(msg_count),
-            str(duration),
+            str(last_button or ""),
+            str(msg_count or ""),
+            str(duration or ""),
         ]
-        sheet.append_row(row, value_input_option="RAW")
+        sheet.append_row(row, value_input_option="RAW", table_range="A1")
         print(f"LOG OK: {event_type} {user_id}")
     except Exception as e:
         print(f"LOG_EVENT ERROR: {e}")
 
+def update_user_record(user_id, username, first_name, language, udata, is_start=False, new_message=False):
+    try:
+        sheet = get_users_sheet()
+        if not sheet:
+            return
+        now = now_kyiv().strftime("%Y-%m-%d %H:%M:%S")
+        all_records = sheet.get_all_values()
+        user_row = None
+        for i, row in enumerate(all_records):
+            if row and str(row[0]) == str(user_id):
+                user_row = i + 1
+                break
+
+        def safe_int(val):
+            try:
+                return int(str(val).strip())
+            except:
+                return 0
+
+        def best(new_val, old_val):
+            return new_val if new_val else old_val
+
+        if user_row:
+            existing = all_records[user_row - 1]
+            while len(existing) < 12:
+                existing.append("")
+            sessions = safe_int(existing[10])
+            messages = safe_int(existing[11])
+            if is_start:
+                sessions += 1
+            if new_message:
+                messages += 1
+            new_values = [[
+                username, first_name,
+                best(udata.get("name", ""), existing[3]),
+                best(udata.get("gender", ""), existing[4]),
+                best(udata.get("age", ""), existing[5]),
+                best(udata.get("location", ""), existing[6]),
+                language,
+                existing[8] if existing[8] else now,
+                now, sessions, messages,
+            ]]
+            sheet.update(values=new_values, range_name=f"B{user_row}:L{user_row}")
+        else:
+            sheet.append_row([
+                str(user_id), username, first_name,
+                udata.get("name", ""), udata.get("gender", ""),
+                udata.get("age", ""), udata.get("location", ""),
+                language, now, now,
+                1 if is_start else 0,
+                1 if new_message else 0,
+            ], value_input_option="RAW", table_range="A1")
+    except Exception as e:
+        print(f"UPDATE_USER ERROR: {e}")
+
 # ============ ДОПОМІЖНІ ============
 
 def get_time_of_day():
-    h = int(datetime.now().strftime("%H"))
+    h = now_kyiv().hour
     if 6 <= h < 12:
         return "Ранок"
     elif 12 <= h < 18:
@@ -79,7 +160,7 @@ def get_time_of_day():
         return "Ніч"
 
 def get_weekday_ua():
-    weekday = datetime.now().strftime("%A")
+    weekday = now_kyiv().strftime("%A")
     return {
         "Monday": "Понеділок", "Tuesday": "Вівторок",
         "Wednesday": "Середа", "Thursday": "Четвер",
@@ -172,7 +253,7 @@ SELF_HARM_PATTERNS = [
 
 VIOLENCE_PATTERNS = [
     r"(він|он|чоловік|муж|батько|партнер)\s*.{0,20}(б'є|бье|бив|бил|вдар|удар)\w*",
-    r"мене\s*(б'ют|бьют|б'є|бье|побил|побив)\w*",
+    r"мене\s*(б'ют|бьють|б'є|бье|побил|побив)\w*",
     r"меня\s*(бьют|бьет|избил|ударил)\w*",
     r"домашн\w*\s*насильств\w*|домашн\w*\s*насили\w*",
     r"(з|)ґвалт\w*|изнасилов\w*",
@@ -265,7 +346,7 @@ class CrisisState:
     def enter(self, category):
         self.active = True
         self.category = category
-        self.entered_at = datetime.now()
+        self.entered_at = now_kyiv()
         self.messages_since = 0
         self.stable_streak = 0
 
@@ -275,7 +356,7 @@ class CrisisState:
         self.messages_since += 1
         if had_marker:
             self.stable_streak = 0
-            self.entered_at = datetime.now()
+            self.entered_at = now_kyiv()
         else:
             self.stable_streak += 1
 
@@ -286,15 +367,13 @@ class CrisisState:
             return False
         if self.stable_streak < 4:
             return False
-        minutes = (datetime.now() - self.entered_at).total_seconds() / 60
+        minutes = (now_kyiv() - self.entered_at).total_seconds() / 60
         return minutes >= 20
 
     def exit(self):
         self.active = False
         self.category = None
         self.stable_streak = 0
-
-# ============ ТЕКСТИ КНОПОК ============
 
 MESSAGES = {
     "anxiety": (
@@ -457,7 +536,7 @@ async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sheet = get_sheet()
         if sheet:
-            sheet.append_row(["TEST", "version_check", str(update.effective_user.id)], value_input_option="RAW")
+            sheet.append_row(["TEST", "version_check", str(update.effective_user.id)], value_input_option="RAW", table_range="A1")
             await update.message.reply_text("✅ Google Sheets працює")
         else:
             await update.message.reply_text("❌ Google Sheets не підключений")
@@ -466,12 +545,17 @@ async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    hour = datetime.now().strftime("%H:00")
+    hour = now_kyiv().strftime("%H:00")
     if user.id not in user_data_store:
         user_data_store[user.id] = {}
     if user.id not in crisis_states:
         crisis_states[user.id] = CrisisState()
     log_event("START", user.id, user.username or "", user.first_name or "", user.language_code or "", hour)
+    try:
+        update_user_record(user.id, user.username or "", user.first_name or "",
+                          user.language_code or "", user_data_store[user.id], is_start=True)
+    except Exception as e:
+        print(f"START user record ERROR: {e}")
     await update.message.reply_text(
         "Привіт 👋\n\nЯ тут, щоб підтримати тебе. Як ти зараз почуваєшся?",
         reply_markup=get_main_keyboard()
@@ -481,7 +565,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    hour = datetime.now().strftime("%H:00")
+    hour = now_kyiv().strftime("%H:00")
 
     if query.data == "menu":
         await query.message.reply_text("Як ти зараз почуваєшся?", reply_markup=get_main_keyboard())
@@ -490,7 +574,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "maksym":
         if user.id not in user_sessions:
             user_sessions[user.id] = []
-        user_session_start[user.id] = datetime.now()
+        user_session_start[user.id] = now_kyiv()
         user_message_count[user.id] = 0
         last_button = user_last_button.get(user.id, "—")
         log_event("MAKSYM_START", user.id, user.username or "", user.first_name or "",
@@ -516,13 +600,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    hour = datetime.now().strftime("%H:00")
+    hour = now_kyiv().strftime("%H:00")
 
     if user.id not in user_data_store:
         user_data_store[user.id] = {}
     if user.id not in crisis_states:
         crisis_states[user.id] = CrisisState()
 
+    prev_data = dict(user_data_store[user.id])
     user_data_store[user.id] = extract_user_info(update.message.text, user_data_store[user.id])
     udata = user_data_store[user.id]
     crisis = crisis_states[user.id]
@@ -564,7 +649,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message_count[user.id] = user_message_count.get(user.id, 0) + 1
     count = user_message_count.get(user.id, 0)
     start_time = user_session_start.get(user.id)
-    duration = int((datetime.now() - start_time).total_seconds() / 60) if start_time else 0
+    duration = int((now_kyiv() - start_time).total_seconds() / 60) if start_time else 0
     last_button = user_last_button.get(user.id, "—")
 
     system_prompt = SYSTEM_PROMPT_CRISIS if crisis.active else SYSTEM_PROMPT_NORMAL
@@ -601,9 +686,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = reply + extra_question
         history.append({"role": "assistant", "content": reply})
         user_sessions[user.id] = history
+
         log_event("MAKSYM_MESSAGE", user.id, user.username or "", user.first_name or "",
                   user.language_code or "", hour,
                   last_button=last_button, msg_count=count, duration=duration)
+
+        if udata != prev_data:
+            try:
+                update_user_record(user.id, user.username or "", user.first_name or "",
+                                  user.language_code or "", udata, new_message=True)
+            except Exception as e:
+                print(f"MSG user record ERROR: {e}")
+
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
