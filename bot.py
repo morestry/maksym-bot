@@ -1,11 +1,9 @@
 # ============================================
 # MAKSYM BOT
-# Версія: 2.7
+# Версія: 2.8
 # Дата: 2026-09-19
-# База: версія що працювала до 23:04 16.09
-# Зміни: webhook замість polling,
-#        кешований Sheets клієнт,
-#        новий кризовий модуль
+# Зміни: прибрано кешування get_sheet,
+#        кожен раз нове з'єднання з Sheets
 # ============================================
 
 import os
@@ -22,29 +20,20 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-PORT = int(os.environ.get("PORT", 8443))
 
-VERSION = "2.7 | 2026-09-19"
+VERSION = "2.8 | 2026-09-19"
 
-# ============ GOOGLE SHEETS (кешований клієнт) ============
-
-_sheet_cache = None
+# ============ GOOGLE SHEETS ============
 
 def get_sheet():
-    global _sheet_cache
     try:
-        if _sheet_cache is not None:
-            return _sheet_cache
         creds_dict = json.loads(GOOGLE_CREDENTIALS)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
-        _sheet_cache = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-        return _sheet_cache
+        return client.open_by_key(GOOGLE_SHEET_ID).sheet1
     except Exception as e:
         print(f"GET_SHEET ERROR: {e}")
-        _sheet_cache = None
         return None
 
 def log_event(event_type, user_id, username="", first_name="", language="",
@@ -52,6 +41,7 @@ def log_event(event_type, user_id, username="", first_name="", language="",
     try:
         sheet = get_sheet()
         if not sheet:
+            print(f"LOG SKIP: no sheet for {event_type}")
             return
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_anon = "Анонім" if not username else "Є username"
@@ -74,8 +64,6 @@ def log_event(event_type, user_id, username="", first_name="", language="",
         print(f"LOG OK: {event_type} {user_id}")
     except Exception as e:
         print(f"LOG_EVENT ERROR: {e}")
-        global _sheet_cache
-        _sheet_cache = None
 
 # ============ ДОПОМІЖНІ ============
 
@@ -196,8 +184,7 @@ _VIOLENCE_RE = [re.compile(p, re.IGNORECASE) for p in VIOLENCE_PATTERNS]
 
 CLASSIFIER_PROMPT = """Ти — класифікатор безпеки. Визнач чи містить повідомлення маркери кризового стану.
 Категорії: suicide, self_harm, violence, none.
-Класифікуй НАМІР. "Я вбив би за каву" — none. Безглузді слова — none.
-Впевненість нижче 0.7 — none.
+Класифікуй НАМІР. Безглузді слова — none. Впевненість нижче 0.7 — none.
 JSON: {"category": "...", "confidence": 0.0-1.0}"""
 
 def _regex_check(text):
@@ -385,16 +372,12 @@ BUTTON_NAMES = {
     "lost": "Втрата опори",
 }
 
-# ============ СТАН ============
-
 user_sessions = {}
 crisis_states = {}
 user_last_button = {}
 user_session_start = {}
 user_message_count = {}
 user_data_store = {}
-
-# ============ ПРОМПТИ ============
 
 SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний ШІ-компаньйон у підході ACT.
 
@@ -441,16 +424,12 @@ SYSTEM_PROMPT_NORMAL = """Ти — Максим, підтримувальний 
 - Чоловічі → зробив, відчув
 
 ГОРЕ: НЕ давай вправ. "Мені дуже шкода. Це величезна втрата."
-НІКОЛИ: "час лікує", "він в кращому місці"
-
 ПІДТРИМКА ДОГЛЯДАЧІВ: → "Коли несеш стільки — хто зараз піклується про тебе?"
-
 ПІСЛЯ ВПРАВИ: "Спробував(ла)? Що помітив(ла)?"
-
 ЗАВЕРШЕННЯ:
-"дякую", "стало краще" → "Радий що трохи легше. Повертайся коли потрібно. 💙"
+"дякую" → "Радий що трохи легше. Повертайся коли потрібно. 💙"
 "поки" → "Бережи себе. 💙"
-"все", "ладно" → "Як ти зараз? Є що ще на серці?" """
+"все" → "Як ти зараз? Є що ще на серці?" """
 
 SYSTEM_PROMPT_CRISIS = """Ти — Максим, теплий та надзвичайно емпатичний психологічний помічник.
 Користувач перебуває у гострому кризовому стані.
@@ -459,12 +438,7 @@ SYSTEM_PROMPT_CRISIS = """Ти — Максим, теплий та надзви�
 - Якщо просить — дай одну просту (дихання або 5-4-3-2-1)
 - Не заспокоюй формулами
 - М'яко заохочуй: 7333, 116 123, 1545
-- Коротко і дбайливо
-- Дзеркаль мову
-- Не питай про спосіб чи план
-- Не повторюй одне й те саме"""
-
-# ============ КЛАВІАТУРА ============
+- Коротко і дбайливо. Дзеркаль мову."""
 
 def get_main_keyboard():
     keyboard = [
@@ -477,8 +451,6 @@ def get_main_keyboard():
         [InlineKeyboardButton("😵 Втрата опори", callback_data="lost")],
     ]
     return InlineKeyboardMarkup(keyboard)
-
-# ============ ХЕНДЛЕРИ ============
 
 async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Maksym Bot v{VERSION}")
@@ -625,19 +597,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = response.choices[0].message.content
         reply = clean_markdown(reply)
-
         if extra_question:
             reply = reply + extra_question
-
         history.append({"role": "assistant", "content": reply})
         user_sessions[user.id] = history
-
         log_event("MAKSYM_MESSAGE", user.id, user.username or "", user.first_name or "",
                   user.language_code or "", hour,
-                  last_button=last_button,
-                  msg_count=count,
-                  duration=duration)
-
+                  last_button=last_button, msg_count=count, duration=duration)
         keyboard = [[InlineKeyboardButton("🏠 Повернутися до меню", callback_data="menu")]]
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
@@ -650,18 +616,7 @@ def main():
     app.add_handler(CommandHandler("version", version))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    if WEBHOOK_URL:
-        print(f"Starting webhook on port {PORT}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TELEGRAM_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
-        )
-    else:
-        print("Starting polling")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
